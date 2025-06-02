@@ -1,4 +1,4 @@
 package org.example.boottestcicd.controller;
 
-public record FishCake() {
+public record FishCake(String shape) {
 }
