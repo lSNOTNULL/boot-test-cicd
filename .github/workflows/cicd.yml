@@ -1,47 +1,87 @@
+# ---------------------------------------------------------------------------
+# GitHub Actions: Docker Image CI with Layer & Gradle Caching
+# 목적
+#   1. PR‧main 브랜치 푸시 시 테스트 → Docker 이미지 빌드 → GHCR 푸시
+#   2. 빌드 속도 향상을 위해
+#        ● Gradle 의존성 캐시
+#        ● Docker Layer 캐시
+#   3. 성공/실패 여부를 Slack Webhook 으로 통보
+# ---------------------------------------------------------------------------
+
 name: Docker Image CI with Layer Caching
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]        # main 브랜치에만 동작
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest    # GitHub 호스트 러너
 
-    permissions:
+    permissions:             # GHCR 푸시에 필요한 최소 권한
       contents: read
       packages: write
 
     steps:
-      # GitHub에 올라간 내 프로젝트 코드를 작업 환경으로 가져오기
+      # 1. 소스 코드 체크아웃 --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
-        # 참고: https://github.com/actions/checkout
+        # https://github.com/actions/checkout
 
-      # Docker 환경 설정 (프로그램을 담는 컨테이너를 만드는 환경을 준비)
+      # 2. JDK 17 설정 ---------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4     # v4.7.1 (2025-06-02 기준 최신)
+        with:
+          java-version: "17"
+          distribution: "temurin"       # Eclipse Temurin
+
+      # 3. Gradle 캐시 ---------------------------------------------------------
+      #    - 의존성·wrapper 캐시를 복원하여 테스트 단계 속도 개선
+      #    - 키에 Gradle 스크립트 해시를 사용해 변경 시 캐시 갱신
+      - name: Cache Gradle
+        id: gradle-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+        # https://docs.github.com/actions/using-workflows/caching-dependencies-to-speed-up-workflows
+
+      # 4. Gradle 테스트 --------------------------------------------------------
+      - name: Test with Gradle
+        uses: gradle/gradle-build-action@v3  # v3.5.0
+        with:
+          arguments: test                   # `./gradlew test`
+        # 테스트 실패 시 이후 단계는 스킵되나,
+        # Slack 알림은 if: always() 조건으로 전송됨
+
+      # 5. Docker Buildx 설치 ---------------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        # 참고: https://github.com/docker/setup-buildx-action
+        # https://github.com/docker/setup-buildx-action
 
-      # GitHub의 저장소(컨테이너를 보관하는 공간)에 로그인
+      # 6. GHCR 로그인 ----------------------------------------------------------
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-        # 참고: https://github.com/docker/login-action
+        # https://github.com/docker/login-action
 
-      # Docker 이미지에 이름표(태그와 라벨)를 자동으로 붙여주는 과정
+      # 7. Docker 메타데이터 추출 ----------------------------------------------
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-        # 참고: https://github.com/docker/metadata-action
+        # https://github.com/docker/metadata-action
 
-      # Docker가 빠르게 작동하도록 이전 작업 내용을 기억하는 캐시 설정
+      # 8. Docker 레이어 캐시 ---------------------------------------------------
+      #    - /tmp/.buildx-cache 에 로컬 캐시 유지
       - name: Cache Docker layers
         uses: actions/cache@v4
         with:
@@ -49,36 +89,34 @@ jobs:
           key: ${{ runner.os }}-buildx-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-buildx-
-        # 참고: https://docs.github.com/actions/using-workflows/caching-dependencies-to-speed-up-workflows
+        # Dockerfile 변경이 적으면 재사용률↑ → 빌드 시간↓ 비용↓
 
-      # 컨테이너 이미지(Docker 이미지)를 실제로 만들어서 저장소에 올리기
+      # 9. Docker 이미지 빌드 & 푸시 --------------------------------------------
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}       # 예: ghcr.io/org/repo:sha-1234
+          labels: ${{ steps.meta.outputs.labels }}   # 빌드 정보 라벨
           cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
+          cache-to:   type=local,dest=/tmp/.buildx-cache
 
-      # Slack으로 결과 전송
+      # 10. Slack 알림 ----------------------------------------------------------
       - name: Send Slack Notification
-        if: always() # Send notification regardless of build success or failure
+        if: always()    # 성공/실패 불문 전송
         uses: act10ns/slack@v2.1.0
         with:
-          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }} # Replace with your Slack webhook URL secret
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
           status: ${{ job.status }}
           message: |
-            *GitHub Actions Workflow Status:*
-            *Repository:* `${{ github.repository }}`
-            *Branch:* `${{ github.ref_name }}`
-            *Commit:* `${{ github.sha }}`
-            *Workflow:* `${{ github.workflow }}`
-            *Run ID:* `${{ github.run_id }}`
-            *Status:* `${{ job.status }}`
-            *Link:* `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
-          # You can customize the message further with more details
-          # For example, if you want to show the Docker image tags:
-          # `*Docker Image Tags:* ${{ steps.meta.outputs.tags }}`
+            *GitHub Actions Workflow Status*
+            • *Repo:* `${{ github.repository }}`
+            • *Branch:* `${{ github.ref_name }}`
+            • *Commit:* `${{ github.sha }}`
+            • *Workflow:* `${{ github.workflow }}`
+            • *Run ID:* `${{ github.run_id }}`
+            • *Status:* `${{ job.status }}`
+            • *Logs:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>
+            • *Image Tags:* `${{ steps.meta.outputs.tags }}`
