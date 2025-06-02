@@ -1,111 +1,100 @@
 # ---------------------------------------------------------------------------
-# GitHub Actions: Docker Image CI with Layer & Gradle Caching
+# GitHub Actions: Docker Image CI + Gradle & Docker Layer Caching + Prod 배포
 # 목적
-#   1. PR‧main 브랜치 푸시 시 테스트 → Docker 이미지 빌드 → GHCR 푸시
-#   2. 빌드 속도 향상을 위해
-#        ● Gradle 의존성 캐시
-#        ● Docker Layer 캐시
-#   3. 성공/실패 여부를 Slack Webhook 으로 통보
+#   1. main 브랜치 push 시 ➜ 테스트 → Docker 이미지 빌드 → GHCR 푸시
+#   2. Gradle 캐시(읽기 전용)·Docker Layer 캐시로 빌드 시간 단축
+#   3. 결과를 Slack Webhook 으로 통보
+#   4. 빌드 성공 후 원격 서버(SSH) 재배포
 # ---------------------------------------------------------------------------
 
 name: Docker Image CI with Layer Caching
 
 on:
   push:
-    branches: [ main ]        # main 브랜치에만 동작
+    branches: [ main ]
 
 jobs:
+  # -------------------------------------------------------------------------
+  # 1) 테스트 및 이미지 빌드·푸시
+  # -------------------------------------------------------------------------
   build-and-push:
-    runs-on: ubuntu-latest    # GitHub 호스트 러너
+    runs-on: ubuntu-latest
 
-    permissions:             # GHCR 푸시에 필요한 최소 권한
-      contents: read
-      packages: write
+    permissions:
+      contents: read   # 소스 읽기
+      packages: write  # GHCR 푸시
 
     steps:
-      # 1. 소스 코드 체크아웃 --------------------------------------------------
+      # 1. 코드 체크아웃 ------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
-        # https://github.com/actions/checkout
 
-      # 2. JDK 17 설정 ---------------------------------------------------------
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4     # v4.7.1 (2025-06-02 기준 최신)
+      # 2. Java 17 + Gradle 환경 설정 ----------------------------------------
+      - name: Set up Java 17 & Gradle
+        uses: gradle/actions/setup-gradle@v3
         with:
-          java-version: "17"
-          distribution: "temurin"       # Eclipse Temurin
+          java-version: 17
+          distribution: temurin
+          cache-read-only: true   # post-job 업로드 생략 → 대기 시간 0
 
-      # 3. Gradle 캐시 ---------------------------------------------------------
-      #    - 의존성·wrapper 캐시를 복원하여 테스트 단계 속도 개선
-      #    - 키에 Gradle 스크립트 해시를 사용해 변경 시 캐시 갱신
-      - name: Cache Gradle
-        id: gradle-cache
+      # 3. 변동 적은 Gradle 캐시 복원 ---------------------------------------
+      - name: Restore Gradle wrapper & modules cache
         uses: actions/cache@v4
         with:
           path: |
-            ~/.gradle/caches
             ~/.gradle/wrapper
+            ~/.gradle/caches/modules-*/files-*/*
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
-        # https://docs.github.com/actions/using-workflows/caching-dependencies-to-speed-up-workflows
 
-      # 4. Gradle 테스트 --------------------------------------------------------
-      - name: Test with Gradle
-        uses: gradle/gradle-build-action@v3  # v3.5.0
-        with:
-          arguments: test                   # `./gradlew test`
-        # 테스트 실패 시 이후 단계는 스킵되나,
-        # Slack 알림은 if: always() 조건으로 전송됨
+      # 4. 단위 테스트 -------------------------------------------------------
+      - name: Run unit tests
+        run: ./gradlew --no-daemon --build-cache --parallel test
 
-      # 5. Docker Buildx 설치 ---------------------------------------------------
+      # 5. Docker Buildx 준비 ----------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        # https://github.com/docker/setup-buildx-action
 
-      # 6. GHCR 로그인 ----------------------------------------------------------
+      # 6. GHCR 로그인 -------------------------------------------------------
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-        # https://github.com/docker/login-action
 
-      # 7. Docker 메타데이터 추출 ----------------------------------------------
+      # 7. Docker 메타데이터 -------------------------------------------------
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-        # https://github.com/docker/metadata-action
 
-      # 8. Docker 레이어 캐시 ---------------------------------------------------
-      #    - /tmp/.buildx-cache 에 로컬 캐시 유지
+      # 8. Docker 레이어 캐시 ------------------------------------------------
       - name: Cache Docker layers
         uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          key: ${{ runner.os }}-buildx-${{ github.ref_name }}   # 브랜치 단위
           restore-keys: |
             ${{ runner.os }}-buildx-
-        # Dockerfile 변경이 적으면 재사용률↑ → 빌드 시간↓ 비용↓
 
-      # 9. Docker 이미지 빌드 & 푸시 --------------------------------------------
+      # 9. 이미지 빌드 & 푸시 ------------------------------------------------
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}       # 예: ghcr.io/org/repo:sha-1234
-          labels: ${{ steps.meta.outputs.labels }}   # 빌드 정보 라벨
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to:   type=local,dest=/tmp/.buildx-cache
+          cache-to:   type=local,dest=/tmp/.buildx-cache,mode=max
 
-      # 10. Slack 알림 ----------------------------------------------------------
+      # 10. Slack 알림 --------------------------------------------------------
       - name: Send Slack Notification
-        if: always()    # 성공/실패 불문 전송
+        if: always()
         uses: act10ns/slack@v2.1.0
         with:
           webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -120,3 +109,38 @@ jobs:
             • *Status:* `${{ job.status }}`
             • *Logs:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>
             • *Image Tags:* `${{ steps.meta.outputs.tags }}`
+
+  # -------------------------------------------------------------------------
+  # 2) 프로덕션 서버 재배포 (SSH)
+  #    - build-and-push 완료 후 실행
+  #    - main 브랜치에서만 동작
+  # -------------------------------------------------------------------------
+  deploy-prod:
+    needs: build-and-push          # 이미지 푸시 성공 시에만
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      # 원격 서버에 SSH 접속 후 컨테이너 교체 -------------------------------
+      - name: Remote redeploy via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}          # 예) 203.0.113.10
+          username: ${{ secrets.SSH_USER }}      # 예) ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}    # PEM 전체 문자열
+          script: |
+            set -e
+            IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+
+            echo "Logging in to GHCR..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull $IMAGE
+
+            echo "Stopping and removing old container..."
+            docker rm -f app || true
+
+            echo "Starting new container..."
+            docker run -d --name app \
+              -p 80:8080 \
+              --restart unless-stopped \
+              $IMAGE
